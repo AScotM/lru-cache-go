@@ -19,7 +19,7 @@ type SecureLRUCache struct {
 	head     *Node
 	tail     *Node
 	size     int
-	mu       sync.RWMutex
+	mu       sync.Mutex
 }
 
 func NewSecureLRUCache(capacity int) *SecureLRUCache {
@@ -33,22 +33,16 @@ func NewSecureLRUCache(capacity int) *SecureLRUCache {
 }
 
 func (c *SecureLRUCache) removeNode(node *Node) {
-	if node == nil {
-		return
-	}
-
 	if node.prev != nil {
 		node.prev.next = node.next
 	} else {
 		c.head = node.next
 	}
-
 	if node.next != nil {
 		node.next.prev = node.prev
 	} else {
 		c.tail = node.prev
 	}
-
 	node.prev = nil
 	node.next = nil
 	c.size--
@@ -57,12 +51,10 @@ func (c *SecureLRUCache) removeNode(node *Node) {
 func (c *SecureLRUCache) addToHead(node *Node) {
 	node.next = c.head
 	node.prev = nil
-
 	if c.head != nil {
 		c.head.prev = node
 	}
 	c.head = node
-
 	if c.tail == nil {
 		c.tail = node
 	}
@@ -70,19 +62,15 @@ func (c *SecureLRUCache) addToHead(node *Node) {
 }
 
 func (c *SecureLRUCache) Get(key int) int {
-	c.mu.RLock()
-	node, exists := c.cache[key]
-	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	node, exists := c.cache[key]
 	if !exists {
 		return -1
 	}
-
-	c.mu.Lock()
 	c.removeNode(node)
 	c.addToHead(node)
-	c.mu.Unlock()
-
 	return node.value
 }
 
@@ -102,8 +90,8 @@ func (c *SecureLRUCache) Put(key, value int) {
 	c.addToHead(node)
 
 	if c.size > c.capacity {
-		lru := c.tail
-		if lru != nil {
+		if c.tail != nil {
+			lru := c.tail
 			c.removeNode(lru)
 			delete(c.cache, lru.key)
 		}
@@ -111,12 +99,11 @@ func (c *SecureLRUCache) Put(key, value int) {
 }
 
 func (c *SecureLRUCache) Dump() map[string]interface{} {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	items := make(map[int]int)
-	order := make([]int, 0)
-
+	order := make([]int, 0, c.size)
 	for node := c.head; node != nil; node = node.next {
 		items[node.key] = node.value
 		order = append(order, node.key)
