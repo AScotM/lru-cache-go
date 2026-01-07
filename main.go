@@ -18,7 +18,6 @@ type SecureLRUCache struct {
 	cache    map[int]*Node
 	head     *Node
 	tail     *Node
-	size     int
 	mu       sync.RWMutex
 }
 
@@ -37,7 +36,6 @@ func NewSecureLRUCache(capacity int) (*SecureLRUCache, error) {
 		cache:    make(map[int]*Node),
 		head:     head,
 		tail:     tail,
-		size:     0,
 	}, nil
 }
 
@@ -50,15 +48,11 @@ func (c *SecureLRUCache) removeNode(node *Node) {
 		return
 	}
 	
-	prev := node.prev
-	next := node.next
-	
-	prev.next = next
-	next.prev = prev
+	node.prev.next = node.next
+	node.next.prev = node.prev
 	
 	node.prev = nil
 	node.next = nil
-	c.size--
 }
 
 func (c *SecureLRUCache) addToHead(node *Node) {
@@ -75,7 +69,6 @@ func (c *SecureLRUCache) addToHead(node *Node) {
 	
 	c.head.next.prev = node
 	c.head.next = node
-	c.size++
 }
 
 func (c *SecureLRUCache) moveToHead(node *Node) {
@@ -91,17 +84,8 @@ func (c *SecureLRUCache) moveToHead(node *Node) {
 		return
 	}
 	
-	prev := node.prev
-	next := node.next
-	
-	prev.next = next
-	next.prev = prev
-	
-	node.next = c.head.next
-	node.prev = c.head
-	
-	c.head.next.prev = node
-	c.head.next = node
+	c.removeNode(node)
+	c.addToHead(node)
 }
 
 func (c *SecureLRUCache) Get(key int) (int, bool) {
@@ -118,20 +102,16 @@ func (c *SecureLRUCache) Get(key int) (int, bool) {
 }
 
 func (c *SecureLRUCache) GetOrDefault(key int, defaultValue int) int {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	node, exists := c.cache[key]
-	c.mu.RUnlock()
-	
 	if !exists {
 		return defaultValue
 	}
-	
-	c.mu.Lock()
+
 	c.moveToHead(node)
-	value := node.value
-	c.mu.Unlock()
-	
-	return value
+	return node.value
 }
 
 func (c *SecureLRUCache) Put(key, value int) {
@@ -144,32 +124,17 @@ func (c *SecureLRUCache) Put(key, value int) {
 		return
 	}
 
-	if c.size >= c.capacity {
+	if len(c.cache) >= c.capacity {
 		lru := c.tail.prev
 		if lru != c.head {
+			c.removeNode(lru)
 			delete(c.cache, lru.key)
-			
-			lruPrev := lru.prev
-			lruNext := lru.next
-			
-			lruPrev.next = lruNext
-			lruNext.prev = lruPrev
-			
-			lru.prev = nil
-			lru.next = nil
-			c.size--
 		}
 	}
 
 	node := &Node{key: key, value: value}
 	c.cache[key] = node
-	
-	node.next = c.head.next
-	node.prev = c.head
-	
-	c.head.next.prev = node
-	c.head.next = node
-	c.size++
+	c.addToHead(node)
 }
 
 func (c *SecureLRUCache) Contains(key int) bool {
@@ -182,7 +147,7 @@ func (c *SecureLRUCache) Contains(key int) bool {
 func (c *SecureLRUCache) Size() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.size
+	return len(c.cache)
 }
 
 func (c *SecureLRUCache) Capacity() int {
@@ -199,24 +164,15 @@ func (c *SecureLRUCache) Resize(newCapacity int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if newCapacity < c.capacity && c.size > newCapacity {
-		for c.size > newCapacity {
+	if newCapacity < c.capacity && len(c.cache) > newCapacity {
+		for len(c.cache) > newCapacity {
 			lru := c.tail.prev
 			if lru == c.head {
 				break
 			}
 			
+			c.removeNode(lru)
 			delete(c.cache, lru.key)
-			
-			lruPrev := lru.prev
-			lruNext := lru.next
-			
-			lruPrev.next = lruNext
-			lruNext.prev = lruPrev
-			
-			lru.prev = nil
-			lru.next = nil
-			c.size--
 		}
 	}
 
@@ -228,10 +184,13 @@ func (c *SecureLRUCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.cache = make(map[int]*Node)
+	for key, node := range c.cache {
+		c.removeNode(node)
+		delete(c.cache, key)
+	}
+	
 	c.head.next = c.tail
 	c.tail.prev = c.head
-	c.size = 0
 }
 
 func (c *SecureLRUCache) Remove(key int) bool {
@@ -243,20 +202,8 @@ func (c *SecureLRUCache) Remove(key int) bool {
 		return false
 	}
 
+	c.removeNode(node)
 	delete(c.cache, key)
-	
-	prev := node.prev
-	next := node.next
-	
-	if prev != nil && next != nil {
-		prev.next = next
-		next.prev = prev
-		
-		node.prev = nil
-		node.next = nil
-		c.size--
-	}
-	
 	return true
 }
 
@@ -272,7 +219,7 @@ func (c *SecureLRUCache) Dump() CacheDump {
 	defer c.mu.RUnlock()
 
 	items := make(map[int]int)
-	order := make([]int, 0, c.size)
+	order := make([]int, 0, len(c.cache))
 
 	for node := c.head.next; node != c.tail; node = node.next {
 		items[node.key] = node.value
@@ -281,7 +228,7 @@ func (c *SecureLRUCache) Dump() CacheDump {
 
 	return CacheDump{
 		Capacity: c.capacity,
-		Size:     c.size,
+		Size:     len(c.cache),
 		Items:    items,
 		Order:    order,
 	}
@@ -311,11 +258,22 @@ func (c *SecureLRUCache) Keys() []int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	keys := make([]int, 0, c.size)
+	keys := make([]int, 0, len(c.cache))
 	for node := c.head.next; node != c.tail; node = node.next {
 		keys = append(keys, node.key)
 	}
 	return keys
+}
+
+func (c *SecureLRUCache) Values() []int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	values := make([]int, 0, len(c.cache))
+	for node := c.head.next; node != c.tail; node = node.next {
+		values = append(values, node.value)
+	}
+	return values
 }
 
 func main() {
