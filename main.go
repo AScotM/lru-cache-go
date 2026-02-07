@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 type Node struct {
@@ -14,11 +15,15 @@ type Node struct {
 }
 
 type SecureLRUCache struct {
-	capacity int
-	cache    map[int]*Node
-	head     *Node
-	tail     *Node
-	mu       sync.RWMutex
+	capacity      int
+	cache         map[int]*Node
+	head          *Node
+	tail          *Node
+	mu            sync.RWMutex
+	hits          int64
+	misses        int64
+	evictions     int64
+	enableMetrics bool
 }
 
 func NewSecureLRUCache(capacity int) (*SecureLRUCache, error) {
@@ -94,10 +99,16 @@ func (c *SecureLRUCache) Get(key int) (int, bool) {
 
 	node, exists := c.cache[key]
 	if !exists {
+		if c.enableMetrics {
+			atomic.AddInt64(&c.misses, 1)
+		}
 		return 0, false
 	}
 
 	c.moveToHead(node)
+	if c.enableMetrics {
+		atomic.AddInt64(&c.hits, 1)
+	}
 	return node.value, true
 }
 
@@ -107,21 +118,27 @@ func (c *SecureLRUCache) GetOrDefault(key int, defaultValue int) int {
 
 	node, exists := c.cache[key]
 	if !exists {
+		if c.enableMetrics {
+			atomic.AddInt64(&c.misses, 1)
+		}
 		return defaultValue
 	}
 
 	c.moveToHead(node)
+	if c.enableMetrics {
+		atomic.AddInt64(&c.hits, 1)
+	}
 	return node.value
 }
 
-func (c *SecureLRUCache) Put(key, value int) {
+func (c *SecureLRUCache) Put(key, value int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if node, exists := c.cache[key]; exists {
 		node.value = value
 		c.moveToHead(node)
-		return
+		return nil
 	}
 
 	if len(c.cache) >= c.capacity {
@@ -129,12 +146,18 @@ func (c *SecureLRUCache) Put(key, value int) {
 		if lru != c.head {
 			c.removeNode(lru)
 			delete(c.cache, lru.key)
+			if c.enableMetrics {
+				atomic.AddInt64(&c.evictions, 1)
+			}
+		} else {
+			return fmt.Errorf("cache is full and cannot evict")
 		}
 	}
 
 	node := &Node{key: key, value: value}
 	c.cache[key] = node
 	c.addToHead(node)
+	return nil
 }
 
 func (c *SecureLRUCache) Contains(key int) bool {
@@ -165,7 +188,9 @@ func (c *SecureLRUCache) Resize(newCapacity int) error {
 	defer c.mu.Unlock()
 
 	if newCapacity < c.capacity && len(c.cache) > newCapacity {
-		for len(c.cache) > newCapacity {
+		// Remove enough nodes to fit new capacity
+		toRemove := len(c.cache) - newCapacity
+		for i := 0; i < toRemove; i++ {
 			lru := c.tail.prev
 			if lru == c.head {
 				break
@@ -173,6 +198,9 @@ func (c *SecureLRUCache) Resize(newCapacity int) error {
 			
 			c.removeNode(lru)
 			delete(c.cache, lru.key)
+			if c.enableMetrics {
+				atomic.AddInt64(&c.evictions, 1)
+			}
 		}
 	}
 
@@ -184,11 +212,7 @@ func (c *SecureLRUCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for key, node := range c.cache {
-		c.removeNode(node)
-		delete(c.cache, key)
-	}
-	
+	c.cache = make(map[int]*Node)
 	c.head.next = c.tail
 	c.tail.prev = c.head
 }
@@ -218,7 +242,7 @@ func (c *SecureLRUCache) Dump() CacheDump {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	items := make(map[int]int)
+	items := make(map[int]int, len(c.cache))
 	order := make([]int, 0, len(c.cache))
 
 	for node := c.head.next; node != c.tail; node = node.next {
@@ -237,6 +261,15 @@ func (c *SecureLRUCache) Dump() CacheDump {
 func (c *SecureLRUCache) ToJSON() (string, error) {
 	dump := c.Dump()
 	bytes, err := json.Marshal(dump)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
+}
+
+func (c *SecureLRUCache) ToJSONPretty() (string, error) {
+	dump := c.Dump()
+	bytes, err := json.MarshalIndent(dump, "", "  ")
 	if err != nil {
 		return "", err
 	}
@@ -274,6 +307,51 @@ func (c *SecureLRUCache) Values() []int {
 		values = append(values, node.value)
 	}
 	return values
+}
+
+func (c *SecureLRUCache) Range(f func(key, value int) bool) {
+	c.mu.RLock()
+	
+	items := make([]struct {
+		key   int
+		value int
+	}, 0, len(c.cache))
+	
+	for node := c.head.next; node != c.tail; node = node.next {
+		items = append(items, struct {
+			key   int
+			value int
+		}{node.key, node.value})
+	}
+	
+	c.mu.RUnlock()
+	
+	for _, item := range items {
+		if !f(item.key, item.value) {
+			break
+		}
+	}
+}
+
+type CacheStats struct {
+	Hits      int64 `json:"hits"`
+	Misses    int64 `json:"misses"`
+	Evictions int64 `json:"evictions"`
+	Size      int   `json:"size"`
+	Capacity  int   `json:"capacity"`
+}
+
+func (c *SecureLRUCache) Stats() CacheStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
+	return CacheStats{
+		Hits:      atomic.LoadInt64(&c.hits),
+		Misses:    atomic.LoadInt64(&c.misses),
+		Evictions: atomic.LoadInt64(&c.evictions),
+		Size:      len(c.cache),
+		Capacity:  c.capacity,
+	}
 }
 
 func main() {
